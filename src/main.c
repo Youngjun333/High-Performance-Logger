@@ -8,38 +8,30 @@
 #include <math.h>
 #include <sched.h>
 
-/* ============================================================================
- * Benchmark Configuration
- * ============================================================================ */
-
+/* Benchmark Configuration */
 #define WARMUP_ITERATIONS       10000
 #define BENCHMARK_ITERATIONS    1000000
 #define LATENCY_SAMPLES         100000
-#define NUM_PRODUCER_THREADS    8
-#define SUSTAINED_DURATION_SEC  10
+#define DEFAULT_NUM_PRODUCER_THREADS    8
+#define DEFAULT_SUSTAINED_DURATION_SEC  10
 
-/* ============================================================================
- * Latency Histogram
- * ============================================================================ */
+static int num_producer_threads   = DEFAULT_NUM_PRODUCER_THREADS;
+static int sustained_duration_sec = DEFAULT_SUSTAINED_DURATION_SEC;
 
 typedef struct {
     uint64_t samples[LATENCY_SAMPLES];
     size_t count;
-    pthread_mutex_t lock;
 } latency_hist_t;
 
 static void hist_init(latency_hist_t* h) {
     memset(h->samples, 0, sizeof(h->samples));
     h->count = 0;
-    pthread_mutex_init(&h->lock, NULL);
 }
 
 static void hist_add(latency_hist_t* h, uint64_t latency_ns) {
-    pthread_mutex_lock(&h->lock);
     if (h->count < LATENCY_SAMPLES) {
         h->samples[h->count++] = latency_ns;
     }
-    pthread_mutex_unlock(&h->lock);
 }
 
 static int compare_uint64(const void* a, const void* b) {
@@ -54,7 +46,6 @@ static void hist_report(latency_hist_t* h, const char* name) {
         return;
     }
     
-    /* Sort samples for percentile calculation */
     qsort(h->samples, h->count, sizeof(uint64_t), compare_uint64);
     
     uint64_t min = h->samples[0];
@@ -64,14 +55,12 @@ static void hist_report(latency_hist_t* h, const char* name) {
     uint64_t p99 = h->samples[(h->count * 99) / 100];
     uint64_t p999 = h->samples[(h->count * 999) / 1000];
     
-    /* Calculate mean */
     uint64_t sum = 0;
     for (size_t i = 0; i < h->count; i++) {
         sum += h->samples[i];
     }
     double mean = (double)sum / h->count;
     
-    /* Calculate stddev */
     double variance = 0;
     for (size_t i = 0; i < h->count; i++) {
         double diff = (double)h->samples[i] - mean;
@@ -89,10 +78,6 @@ static void hist_report(latency_hist_t* h, const char* name) {
     printf("    Max:     %10lu\n", max);
 }
 
-/* ============================================================================
- * Benchmark Helpers
- * ============================================================================ */
-
 static void print_separator(void) {
     printf("\n");
     printf("════════════════════════════════════════════════════════════════\n");
@@ -108,10 +93,7 @@ static double ns_to_mops(uint64_t total_ns, uint64_t operations) {
     return (double)operations / ((double)total_ns / 1e9) / 1e6;
 }
 
-/* ============================================================================
- * Benchmark 1: Single-Threaded Throughput
- * ============================================================================ */
-
+/* Benchmark 1: Single-Threaded Throughput */
 static void benchmark_single_thread(void) {
     print_header("Benchmark 1: Single-Threaded Throughput");
     
@@ -121,14 +103,12 @@ static void benchmark_single_thread(void) {
         return;
     }
     
-    /* Warmup */
     printf("  Warming up (%d iterations)...\n", WARMUP_ITERATIONS);
     for (int i = 0; i < WARMUP_ITERATIONS; i++) {
         HPLOG_INFO(log, "Warmup message %d", i);
     }
     hplog_flush(log);
     
-    /* Benchmark */
     printf("  Running benchmark (%d iterations)...\n", BENCHMARK_ITERATIONS);
     
     uint64_t start = hplog_monotonic_ns();
@@ -159,10 +139,7 @@ static void benchmark_single_thread(void) {
     hplog_shutdown(log);
 }
 
-/* ============================================================================
- * Benchmark 2: Multi-Producer Throughput
- * ============================================================================ */
-
+/* Benchmark 2: Multi-Producer Throughput */
 typedef struct {
     hplog_t* log;
     int thread_id;
@@ -200,17 +177,16 @@ static void benchmark_multi_producer(void) {
         return;
     }
     
-    pthread_t threads[NUM_PRODUCER_THREADS];
-    producer_args_t args[NUM_PRODUCER_THREADS];
-    int iterations_per_thread = BENCHMARK_ITERATIONS / NUM_PRODUCER_THREADS;
-    
-    printf("  Running with %d producer threads...\n", NUM_PRODUCER_THREADS);
+    pthread_t *threads = malloc(num_producer_threads * sizeof(pthread_t));
+    producer_args_t *args = malloc(num_producer_threads * sizeof(producer_args_t));
+    int iterations_per_thread = BENCHMARK_ITERATIONS / num_producer_threads;
+
+    printf("  Running with %d producer threads...\n", num_producer_threads);
     printf("  Each thread: %d iterations\n", iterations_per_thread);
-    
+
     uint64_t start = hplog_monotonic_ns();
-    
-    /* Start producer threads */
-    for (int i = 0; i < NUM_PRODUCER_THREADS; i++) {
+
+    for (int i = 0; i < num_producer_threads; i++) {
         args[i].log = log;
         args[i].thread_id = i;
         args[i].iterations = iterations_per_thread;
@@ -218,57 +194,54 @@ static void benchmark_multi_producer(void) {
         args[i].dropped = 0;
         pthread_create(&threads[i], NULL, producer_thread, &args[i]);
     }
-    
-    /* Wait for all threads */
-    for (int i = 0; i < NUM_PRODUCER_THREADS; i++) {
+
+    for (int i = 0; i < num_producer_threads; i++) {
         pthread_join(threads[i], NULL);
     }
-    
+
     uint64_t end = hplog_monotonic_ns();
-    
+
     hplog_flush(log);
-    
+
     hplog_stats_t stats;
     hplog_get_stats(log, &stats);
-    
+
     uint64_t total_elapsed = end - start;
-    uint64_t total_iterations = iterations_per_thread * NUM_PRODUCER_THREADS;
+    uint64_t total_iterations = iterations_per_thread * num_producer_threads;
     double throughput = ns_to_mops(total_elapsed, total_iterations);
-    
+
     uint64_t total_dropped = 0;
     uint64_t max_thread_time = 0;
-    for (int i = 0; i < NUM_PRODUCER_THREADS; i++) {
+    for (int i = 0; i < num_producer_threads; i++) {
         total_dropped += args[i].dropped;
         if (args[i].elapsed_ns > max_thread_time) {
             max_thread_time = args[i].elapsed_ns;
         }
     }
-    
+
     printf("\n  Results:\n");
     printf("    Total time:         %.3f ms\n", total_elapsed / 1e6);
     printf("    Aggregate throughput: %.2f M ops/sec\n", throughput);
-    printf("    Per-thread throughput: %.2f M ops/sec\n", throughput / NUM_PRODUCER_THREADS);
+    printf("    Per-thread throughput: %.2f M ops/sec\n", throughput / num_producer_threads);
     printf("    Total iterations:   %lu\n", total_iterations);
     printf("    Messages logged:    %lu\n", stats.total_consumed);
-    printf("    Messages dropped:   %lu (%.2f%%)\n", 
-           stats.dropped_count, 
+    printf("    Messages dropped:   %lu (%.2f%%)\n",
+           stats.dropped_count,
            (double)stats.dropped_count / total_iterations * 100);
     printf("    Bytes written:      %.2f MB\n", stats.bytes_written / 1e6);
-    
-    /* Per-thread stats */
+
     printf("\n  Per-thread stats:\n");
-    for (int i = 0; i < NUM_PRODUCER_THREADS; i++) {
-        printf("    Thread %d: %.3f ms, %lu dropped\n", 
+    for (int i = 0; i < num_producer_threads; i++) {
+        printf("    Thread %d: %.3f ms, %lu dropped\n",
                i, args[i].elapsed_ns / 1e6, args[i].dropped);
     }
-    
+
     hplog_shutdown(log);
+    free(threads);
+    free(args);
 }
 
-/* ============================================================================
- * Benchmark 3: Latency Distribution
- * ============================================================================ */
-
+/* Benchmark 3: Latency Distribution */
 static void benchmark_latency(void) {
     print_header("Benchmark 3: Latency Distribution");
     
@@ -281,14 +254,12 @@ static void benchmark_latency(void) {
     latency_hist_t hist;
     hist_init(&hist);
     
-    /* Warmup */
     printf("  Warming up...\n");
     for (int i = 0; i < WARMUP_ITERATIONS; i++) {
         HPLOG_INFO(log, "Warmup %d", i);
     }
     hplog_flush(log);
     
-    /* Collect latency samples */
     printf("  Collecting %d latency samples...\n", LATENCY_SAMPLES);
     
     for (int i = 0; i < LATENCY_SAMPLES; i++) {
@@ -298,7 +269,6 @@ static void benchmark_latency(void) {
         
         hist_add(&hist, end - start);
         
-        /* Small delay to avoid sustained backpressure */
         if (i % 1000 == 0) {
             struct timespec ts = {0, 100000}; /* 100us */
             nanosleep(&ts, NULL);
@@ -319,10 +289,7 @@ static void benchmark_latency(void) {
     hplog_shutdown(log);
 }
 
-/* ============================================================================
- * Benchmark 4: Backpressure Comparison
- * ============================================================================ */
-
+/* Benchmark 4: Backpressure Comparison */
 static void benchmark_backpressure(void) {
     print_header("Benchmark 4: Backpressure Strategy Comparison");
     
@@ -342,8 +309,7 @@ static void benchmark_backpressure(void) {
             continue;
         }
         
-        /* Burst test - try to overwhelm the consumer */
-        int burst_size = HPLOG_BUFFER_SIZE * 2;  /* 2x buffer size */
+        int burst_size = HPLOG_BUFFER_SIZE * 2;
         
         uint64_t start = hplog_monotonic_ns();
         
@@ -372,10 +338,7 @@ static void benchmark_backpressure(void) {
     }
 }
 
-/* ============================================================================
- * Benchmark 5: Sustained Load
- * ============================================================================ */
-
+/* Benchmark 5: Sustained Load */
 typedef struct {
     hplog_t* log;
     _Atomic bool* running;
@@ -405,95 +368,109 @@ static void* sustained_producer(void* arg) {
 static void benchmark_sustained(void) {
     print_header("Benchmark 5: Sustained Load Test");
     
-    printf("  Duration: %d seconds\n", SUSTAINED_DURATION_SEC);
-    printf("  Producers: %d threads\n", NUM_PRODUCER_THREADS);
-    
+    printf("  Duration: %d seconds\n", sustained_duration_sec);
+    printf("  Producers: %d threads\n", num_producer_threads);
+
     hplog_t* log = hplog_init("logs/bench_sustained.log", HPLOG_INFO, HPLOG_BP_DROP);
     if (!log) {
         fprintf(stderr, "Failed to initialize logger\n");
         return;
     }
-    
+
     _Atomic bool running = true;
-    pthread_t threads[NUM_PRODUCER_THREADS];
-    sustained_args_t args[NUM_PRODUCER_THREADS];
-    
+    pthread_t *threads = malloc(num_producer_threads * sizeof(pthread_t));
+    sustained_args_t *args = malloc(num_producer_threads * sizeof(sustained_args_t));
+
     /* Start producer threads */
-    for (int i = 0; i < NUM_PRODUCER_THREADS; i++) {
+    for (int i = 0; i < num_producer_threads; i++) {
         args[i].log = log;
         args[i].running = &running;
         args[i].count = 0;
         args[i].dropped = 0;
         pthread_create(&threads[i], NULL, sustained_producer, &args[i]);
     }
-    
+
     /* Monitor and report every second */
+    uint64_t sustained_start = hplog_monotonic_ns();
     printf("\n  Progress:\n");
-    for (int sec = 0; sec < SUSTAINED_DURATION_SEC; sec++) {
+    for (int sec = 0; sec < sustained_duration_sec; sec++) {
         sleep(1);
-        
+
         hplog_stats_t stats;
         hplog_get_stats(log, &stats);
-        
-        double throughput = (double)stats.total_produced / (sec + 1) / 1e6;
+
+        double throughput = ns_to_mops(hplog_monotonic_ns() - sustained_start, stats.total_produced);
         printf("    [%2d/%d] Produced: %10lu, Consumed: %10lu, Dropped: %6lu (%.2f M/s)\n",
-               sec + 1, SUSTAINED_DURATION_SEC,
+               sec + 1, sustained_duration_sec,
                stats.total_produced, stats.total_consumed, stats.dropped_count,
                throughput);
     }
-    
+
     /* Stop threads */
     atomic_store(&running, false);
-    
-    for (int i = 0; i < NUM_PRODUCER_THREADS; i++) {
+
+    for (int i = 0; i < num_producer_threads; i++) {
         pthread_join(threads[i], NULL);
     }
-    
+
     hplog_flush(log);
-    
+
     hplog_stats_t stats;
     hplog_get_stats(log, &stats);
-    
+
     uint64_t total_attempts = 0;
     uint64_t total_dropped = 0;
-    for (int i = 0; i < NUM_PRODUCER_THREADS; i++) {
+    for (int i = 0; i < num_producer_threads; i++) {
         total_attempts += args[i].count;
         total_dropped += args[i].dropped;
     }
-    
-    double avg_throughput = (double)stats.total_produced / SUSTAINED_DURATION_SEC / 1e6;
-    
+
+    uint64_t sustained_elapsed = hplog_monotonic_ns() - sustained_start;
+    double avg_throughput = ns_to_mops(sustained_elapsed, stats.total_produced);
+
     printf("\n  Final Results:\n");
     printf("    Total produced:   %lu\n", stats.total_produced);
     printf("    Total consumed:   %lu\n", stats.total_consumed);
-    printf("    Total dropped:    %lu (%.4f%%)\n", 
+    printf("    Total dropped:    %lu (%.4f%%)\n",
            stats.dropped_count,
            (double)stats.dropped_count / total_attempts * 100);
     printf("    Avg throughput:   %.2f M ops/sec\n", avg_throughput);
-    printf("    Bytes written:    %.2f MB (%.2f MB/s)\n", 
+    printf("    Bytes written:    %.2f MB (%.2f MB/s)\n",
            stats.bytes_written / 1e6,
-           stats.bytes_written / 1e6 / SUSTAINED_DURATION_SEC);
+           stats.bytes_written / 1e6 / ((double)sustained_elapsed / 1e9));
     printf("    Buffer flushes:   %lu\n", stats.flush_count);
-    
+
     hplog_shutdown(log);
+    free(threads);
+    free(args);
 }
 
-/* ============================================================================
- * Main
- * ============================================================================ */
-
 int main(int argc, char* argv[]) {
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--threads") == 0 && i + 1 < argc) {
+            num_producer_threads = atoi(argv[++i]);
+            if (num_producer_threads < 1) num_producer_threads = 1;
+        } else if (strcmp(argv[i], "--duration") == 0 && i + 1 < argc) {
+            sustained_duration_sec = atoi(argv[++i]);
+            if (sustained_duration_sec < 1) sustained_duration_sec = 1;
+        } else {
+            fprintf(stderr, "Usage: %s [--threads N] [--duration SEC]\n", argv[0]);
+            return 1;
+        }
+    }
+
     printf("\n");
     printf("╔══════════════════════════════════════════════════════════════════╗\n");
     printf("║     HIGH-PERFORMANCE LOGGING SYSTEM - BENCHMARK SUITE            ║\n");
     printf("╚══════════════════════════════════════════════════════════════════╝\n");
-    
+
     printf("\nConfiguration:\n");
     printf("  Ring buffer size:  %d entries\n", HPLOG_BUFFER_SIZE);
     printf("  Entry size:        %zu bytes\n", sizeof(hplog_entry_t));
     printf("  Max message len:   %d bytes\n", HPLOG_MAX_MSG_LEN);
     printf("  Benchmark iters:   %d\n", BENCHMARK_ITERATIONS);
-    printf("  Producer threads:  %d\n", NUM_PRODUCER_THREADS);
+    printf("  Producer threads:  %d\n", num_producer_threads);
+    printf("  Sustained duration: %d seconds\n", sustained_duration_sec);
     
     /* Run benchmarks */
     benchmark_single_thread();
