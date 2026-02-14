@@ -93,7 +93,7 @@ static hplog_entry_t* ringbuf_try_reserve(hplog_ringbuf_t* rb) {
         uint32_t seq = atomic_load_explicit(&entry->sequence, memory_order_acquire);
 
         if (seq == (uint32_t)head) {
-            if (atomic_compare_exchange_weak_explicit(&rb->head, &head, head + 1, memory_order_acquire, memory_order_relaxed)) {
+            if (atomic_compare_exchange_weak_explicit(&rb->head, &head, head + 1, memory_order_acq_rel, memory_order_relaxed)) {
                 return entry;
             }
         }
@@ -126,7 +126,7 @@ static hplog_entry_t* ringbuf_try_reserve(hplog_ringbuf_t* rb) {
 static void ringbuf_commit(hplog_ringbuf_t* rb, hplog_entry_t* entry) {
     uint32_t i = (uint32_t)(entry - rb->entries);
     atomic_store_explicit(&entry->sequence, i + 1, memory_order_release);
-    atomic_fetch_add_explicit(&rb->total_produced, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&rb->total_produced, 1, memory_order_release);
 }
 
 /* ============================================================================
@@ -178,7 +178,7 @@ static void ringbuf_release(hplog_ringbuf_t* rb, hplog_entry_t* entry) {
     uint64_t tail = atomic_fetch_add_explicit(&rb->tail, 1, memory_order_relaxed);
     uint32_t seq = tail + HPLOG_BUFFER_SIZE;
     atomic_store_explicit(&entry->sequence, seq, memory_order_release);
-    atomic_fetch_add_explicit(&rb->total_consumed, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&rb->total_consumed, 1, memory_order_release);
 }
 
 /* ============================================================================
@@ -230,7 +230,7 @@ static int mmap_grow(hplog_t* log, size_t new_size) {
  * @return 0 on success, -1 on failure
  * ============================================================================ */
 static int mmap_write(hplog_t* log, const char* data, size_t len) {
-    if (log->file_offset + len > log->file_size) {
+    if (log->file_offset + len > log->file_size || !log->file_map) {
         size_t new_size = log->file_size + HPLOG_FILE_GROW_SIZE;
         while (new_size < log->file_offset + len)
             new_size += HPLOG_FILE_GROW_SIZE;
@@ -408,8 +408,17 @@ error:
 void hplog_shutdown(hplog_t* log) {
     if (!log) return;
     
-    atomic_store(&log->shutdown_requested, true);
-    atomic_store(&log->running, false);
+    atomic_store_explicit(&log->shutdown_requested, true, memory_order_release);
+
+    /* Wait for in-flight producers to finish committing their reserved slots.
+     * After shutdown_requested is visible, no new reservations can occur.
+     * head == total_produced means every reserved slot has been committed. */
+    while (atomic_load_explicit(&log->ringbuf->head, memory_order_acquire) !=
+           atomic_load_explicit(&log->ringbuf->total_produced, memory_order_acquire)) {
+        sched_yield();
+    }
+
+    atomic_store_explicit(&log->running, false, memory_order_release);
     
     pthread_join(log->consumer_thread, NULL);
     
@@ -608,5 +617,7 @@ void hplog_get_stats(hplog_t* log, hplog_stats_t* stats) {
     stats->bytes_written  = atomic_load_explicit(&log->bytes_written, memory_order_relaxed);
     stats->flush_count    = atomic_load_explicit(&log->flush_count, memory_order_relaxed);
 
-    stats->buffer_usage = stats->total_produced - stats->total_consumed;
+    stats->buffer_usage = (stats->total_produced >= stats->total_consumed)
+                         ? stats->total_produced - stats->total_consumed
+                         : 0;
 }
